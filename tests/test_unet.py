@@ -3,11 +3,12 @@ import base64
 import time
 import requests
 import numpy as np
+import msgpack
 from typing import Tuple, Dict, Any
 
 
-class ModelTester(unittest.TestCase):
-    """Test class for model inference API testing."""
+class MosecModelTester(unittest.TestCase):
+    """Test class for Mosec UNet inference API testing."""
     
     def setUp(self):
         """Setup method to initialize test data."""
@@ -20,8 +21,8 @@ class ModelTester(unittest.TestCase):
         self.whisper_chunks = self.whisper_chunks.astype(np.float16)
         self.latents = self.latents.astype(np.float16)
         
-        # API endpoint
-        self.url = "http://localhost:8000/predict"
+        # Mosec API endpoint (default mosec endpoint)
+        self.url = "http://localhost:8000/inference"
         
         # Expected shapes
         self.expected_whisper_shape = (25, 50, 384)
@@ -40,12 +41,30 @@ class ModelTester(unittest.TestCase):
         array = np.frombuffer(output_bytes, dtype=np.float16)
         return array.reshape(expected_shape)
 
+    def get_error_message(self, response: requests.Response) -> str:
+        """Extract error message from response safely."""
+        try:
+            if response.headers.get('content-type') == 'application/msgpack':
+                return str(msgpack.unpackb(response.content))
+            return response.content.decode('utf-8')
+        except Exception:
+            return str(response.content)
+
     def make_request(self, data: Dict[str, Any]) -> Tuple[requests.Response, float]:
         """Helper method to make API request and measure time."""
         start = time.perf_counter()
-        response = requests.post(self.url, json=data)
-        elapsed = time.perf_counter() - start
-        return response, elapsed
+        headers = {"Content-Type": "application/msgpack"}
+        packed_data = msgpack.packb(data)
+        
+        try:
+            response = requests.post(self.url, data=packed_data, headers=headers)
+            if response.status_code == 200:
+                # For successful responses, unpack msgpack content
+                response._content = msgpack.unpackb(response.content)
+            return response, time.perf_counter() - start
+        except Exception as e:
+            print(f"Request failed: {str(e)}")
+            raise
 
     def test_successful_inference(self):
         """Test successful model inference with valid input."""
@@ -57,12 +76,16 @@ class ModelTester(unittest.TestCase):
         response, elapsed_time = self.make_request(request_data)
         
         # Assertions
-        self.assertEqual(response.status_code, 200, "API request failed")
-        self.assertIn('output', response.json(), "Response missing 'output' field")
+        self.assertEqual(response.status_code, 200, 
+                        f"API request failed with status {response.status_code}: {self.get_error_message(response)}")
+        
+        # Response is now unpacked msgpack
+        response_data = response._content
+        self.assertIn('output', response_data, "Response missing 'output' field")
         
         # Process response
         response_array = self.decode_response(
-            response.json()["output"], 
+            response_data["output"], 
             self.expected_output_shape
         )
         
@@ -90,8 +113,14 @@ class ModelTester(unittest.TestCase):
         for data, case_name in test_cases:
             with self.subTest(case=case_name):
                 response, _ = self.make_request(data)
-                self.assertEqual(response.status_code, 400, f"Expected 400 for {case_name}")
-                self.assertIn('detail', response.json(), "Error response missing detail")
+                self.assertIn(response.status_code, [400, 422], 
+                            f"Expected 400 or 422 for {case_name}, got {response.status_code}: {self.get_error_message(response)}")
+                
+                error_msg = self.get_error_message(response)
+                self.assertTrue(
+                    any(err_key in error_msg.lower() for err_key in ['error', 'invalid', 'missing']),
+                    f"Error response missing error details: {error_msg}"
+                )
 
     def test_invalid_encoding(self):
         """Test error handling for invalid base64 encoding."""
@@ -104,7 +133,8 @@ class ModelTester(unittest.TestCase):
         
         for data in test_cases:
             response, _ = self.make_request(data)
-            self.assertEqual(response.status_code, 400, "Expected 400 for invalid encoding")
+            self.assertIn(response.status_code, [400, 422], 
+                         f"Expected 400 or 422 for invalid encoding, got {response.status_code}: {self.get_error_message(response)}")
 
     def test_invalid_shapes(self):
         """Test error handling for arrays with invalid shapes."""
@@ -115,38 +145,40 @@ class ModelTester(unittest.TestCase):
             'latent': self.encode_array(self.latents)
         }
         response, _ = self.make_request(wrong_batch_request)
-        self.assertEqual(response.status_code, 400, "Expected 400 for wrong batch size")
+        self.assertIn(response.status_code, [400, 422], 
+                     f"Expected 400 or 422 for wrong batch size, got {response.status_code}: {self.get_error_message(response)}")
 
         # Test with incompatible reshape dimensions
-        wrong_shape_whisper = np.random.randn(25, 49, 384).astype(np.float16)  # Wrong middle dimension
+        wrong_shape_whisper = np.random.randn(25, 49, 384).astype(np.float16)
         wrong_shape_request = {
             'whisper': self.encode_array(wrong_shape_whisper),
             'latent': self.encode_array(self.latents)
         }
         response, _ = self.make_request(wrong_shape_request)
-        self.assertEqual(response.status_code, 400, "Expected 400 for incompatible dimensions")
+        self.assertIn(response.status_code, [400, 422], 
+                     f"Expected 400 or 422 for wrong shape, got {response.status_code}: {self.get_error_message(response)}")
 
     def test_invalid_data_types(self):
         """Test error handling for invalid data types."""
-        # Test with different data types
         float32_data = self.whisper_chunks.astype(np.float32)
         wrong_type_request = {
             'whisper': self.encode_array(float32_data),
             'latent': self.encode_array(self.latents)
         }
         response, _ = self.make_request(wrong_type_request)
-        self.assertNotEqual(response.status_code, 200, "Expected error for wrong data type")
+        self.assertIn(response.status_code, [400, 422], 
+                     f"Expected 400 or 422 for wrong data type, got {response.status_code}")
 
     def test_large_payload(self):
         """Test handling of large payloads."""
-        # Create a large array (2x normal size)
         large_whisper = np.tile(self.whisper_chunks, (2, 1, 1))
         large_request = {
             'whisper': self.encode_array(large_whisper),
             'latent': self.encode_array(self.latents)
         }
         response, _ = self.make_request(large_request)
-        self.assertEqual(response.status_code, 400, "Expected 400 for oversized payload")
+        self.assertIn(response.status_code, [400, 413, 422], 
+                     f"Expected 400, 413, or 422 for oversized payload, got {response.status_code}: {self.get_error_message(response)}")
 
     def test_concurrent_requests(self):
         """Test handling of concurrent requests."""
@@ -158,20 +190,25 @@ class ModelTester(unittest.TestCase):
         }
         
         def make_concurrent_request():
-            return requests.post(self.url, json=request_data)
+            try:
+                response, _ = self.make_request(request_data)
+                return response
+            except Exception as e:
+                print(f"Concurrent request failed: {str(e)}")
+                raise
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             futures = [executor.submit(make_concurrent_request) for _ in range(5)]
             responses = [f.result() for f in concurrent.futures.as_completed(futures)]
         
-        # Verify all responses
         for response in responses:
-            self.assertEqual(response.status_code, 200, "Concurrent request failed")
-
-
-def run_tests():
-    unittest.main(verbosity=2)
+            self.assertEqual(
+                response.status_code, 200, 
+                f"Concurrent request failed with status {response.status_code}: {self.get_error_message(response)}"
+            )
+            response_data = response._content
+            self.assertIn('output', response_data, "Response missing 'output' field")
 
 
 if __name__ == "__main__":
-    run_tests()
+    unittest.main(verbosity=2)
