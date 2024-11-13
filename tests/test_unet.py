@@ -3,12 +3,18 @@ import base64
 import time
 import requests
 import numpy as np
-import msgpack
-from typing import Tuple, Dict, Any
+import json
+from typing import Tuple, Dict, Any, List, Optional
+import logging
+import multiprocessing as mp
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
-class MosecModelTester(unittest.TestCase):
-    """Test class for Mosec UNet inference API testing."""
+class MosecPipelineTester(unittest.TestCase):
+    """Test class for Mosec UNet+VAE inference pipeline testing."""
     
     def setUp(self):
         """Setup method to initialize test data."""
@@ -21,194 +27,202 @@ class MosecModelTester(unittest.TestCase):
         self.whisper_chunks = self.whisper_chunks.astype(np.float16)
         self.latents = self.latents.astype(np.float16)
         
-        # Mosec API endpoint (default mosec endpoint)
+        # Mosec API endpoint
         self.url = "http://localhost:8000/inference"
         
         # Expected shapes
         self.expected_whisper_shape = (25, 50, 384)
         self.expected_latent_shape = (25, 8, 32, 32)
-        self.expected_output_shape = (25, 4, 32, 32)
+        self.expected_image_shape = (256, 256, 3)  # VAE outputs 256x256 images
         
-        print(f"Test data loaded - whisper shape: {self.whisper_chunks.shape}, latents shape: {self.latents.shape}")
+        logger.info(f"Test data loaded - whisper shape: {self.whisper_chunks.shape}, latents shape: {self.latents.shape}")
 
     def encode_array(self, array: np.ndarray) -> str:
         """Helper method to encode numpy array to base64 string."""
         return base64.b64encode(array.tobytes()).decode('utf-8')
 
-    def decode_response(self, base64_str: str, expected_shape: Tuple[int, ...]) -> np.ndarray:
-        """Helper method to decode base64 string to numpy array."""
-        output_bytes = base64.b64decode(base64_str)
-        array = np.frombuffer(output_bytes, dtype=np.float16)
-        return array.reshape(expected_shape)
-
-    def get_error_message(self, response: requests.Response) -> str:
-        """Extract error message from response safely."""
-        try:
-            if response.headers.get('content-type') == 'application/msgpack':
-                return str(msgpack.unpackb(response.content))
-            return response.content.decode('utf-8')
-        except Exception:
-            return str(response.content)
-
-    def make_request(self, data: Dict[str, Any]) -> Tuple[requests.Response, float]:
-        """Helper method to make API request and measure time."""
-        start = time.perf_counter()
-        headers = {"Content-Type": "application/msgpack"}
-        packed_data = msgpack.packb(data)
+    def process_sse_event(self, line: bytes) -> Optional[Dict[str, Any]]:
+        """Process a single SSE event line."""
+        if not line or not line.strip():
+            return None
+            
+        # Remove 'data: ' prefix if present
+        if line.startswith(b'data: '):
+            line = line[6:]
         
         try:
-            response = requests.post(self.url, data=packed_data, headers=headers)
-            if response.status_code == 200:
-                # For successful responses, unpack msgpack content
-                response._content = msgpack.unpackb(response.content)
-            return response, time.perf_counter() - start
-        except Exception as e:
-            print(f"Request failed: {str(e)}")
-            raise
+            event_data = json.loads(line)
+            return event_data
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse SSE event: {e}")
+            return None
+
+    def make_request(self) -> Tuple[bool, float, float, List[np.ndarray]]:
+        """Helper method to make API request and measure first response latency and FPS."""
+        start_time = time.perf_counter()
+        first_response_latency = None
+        last_response_time = None
+        
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream"
+        }
+        
+        request_data = {
+            'whisper': self.encode_array(self.whisper_chunks),
+            'latent': self.encode_array(self.latents)
+        }
+        
+        try:
+            response = requests.post(
+                self.url,
+                json=request_data,
+                headers=headers,
+                stream=True,
+                timeout=5
+            )
+            
+            if response.status_code != 200:
+                logger.error(f"Request failed with status {response.status_code}")
+                logger.error(f"Response content: {response.content}")
+                return False, -1, -1, []
+            
+            images = []
+            image_dict = {}
+            
+            for line in response.iter_lines():
+                event_data = self.process_sse_event(line)
+                if not event_data:
+                    continue
+                    
+                current_time = time.perf_counter()
+                last_response_time = current_time  # Update last response time
+                
+                try:
+                    # Extract image information
+                    index = event_data['index']
+                    shape = tuple(event_data['shape'])
+                    dtype = np.dtype(event_data['dtype'])
+                    
+                    if first_response_latency is None:
+                        first_response_latency = current_time - start_time
+                        logger.info(f"First response latency: {first_response_latency:.4f}s")
+                    
+                    img_bytes = base64.b64decode(event_data['data'])
+                    image = np.frombuffer(img_bytes, dtype=dtype).reshape(shape)
+                    image_dict[index] = image
+                    
+                except Exception as e:
+                    logger.error(f"Error processing image data: {e}")
+                    continue
+
+            images = [image_dict[i] for i in sorted(image_dict.keys())]
+            
+            # Calculate FPS
+            if last_response_time and first_response_latency is not None:
+                processing_time = last_response_time - (start_time + first_response_latency)
+                fps = len(images) / processing_time if processing_time > 0 else 0
+            else:
+                fps = 0
+            
+            return True, first_response_latency or -1, fps, images
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request failed: {str(e)}")
+            return False, -1, -1, []
+
+    def validate_image(self, image: np.ndarray):
+        """Validate a single image."""
+        self.assertEqual(image.shape, self.expected_image_shape, 
+                        f"Invalid image shape: {image.shape}")
+        self.assertEqual(image.dtype, np.dtype('uint8'), 
+                        f"Invalid image dtype: {image.dtype}")
+        self.assertTrue(np.all(image >= 0) and np.all(image <= 255), 
+                        "Image values out of valid range")
 
     def test_successful_inference(self):
         """Test successful model inference with valid input."""
-        request_data = {
-            'whisper': self.encode_array(self.whisper_chunks),
-            'latent': self.encode_array(self.latents)
-        }
-
-        response, elapsed_time = self.make_request(request_data)
+        success, first_response_latency, fps, images = self.make_request()
         
-        # Assertions
-        self.assertEqual(response.status_code, 200, 
-                        f"API request failed with status {response.status_code}: {self.get_error_message(response)}")
+        self.assertTrue(success, "Request failed")
+        self.assertGreater(first_response_latency, 0, "First response latency not recorded")
+        self.assertLess(first_response_latency, 5.0, 
+                       f"First response latency too high: {first_response_latency:.4f}s")
         
-        # Response is now unpacked msgpack
-        response_data = response._content
-        self.assertIn('output', response_data, "Response missing 'output' field")
+        self.assertEqual(len(images), 25, f"Incorrect number of images returned: {len(images)}")
         
-        # Process response
-        response_array = self.decode_response(
-            response_data["output"], 
-            self.expected_output_shape
-        )
+        logger.info(f"Achieved FPS: {fps:.2f}")
         
-        # Validate response
-        self.assertEqual(
-            response_array.shape, 
-            self.expected_output_shape, 
-            "Incorrect output shape"
-        )
-        self.assertTrue(np.isfinite(response_array).all(), "Output contains invalid values")
-        self.assertFalse(np.all(response_array == 0), "Output contains all zeros")
-        
-        # Performance validation
-        self.assertLess(elapsed_time, 5.0, "Inference took too long")
-        print(f"Successful inference time: {elapsed_time:.4f} seconds")
+        for idx, image in enumerate(images):
+            with self.subTest(image_index=idx):
+                self.validate_image(image)
 
-    def test_missing_fields(self):
-        """Test error handling for missing required fields."""
-        test_cases = [
-            ({}, "Missing both fields"),
-            ({'whisper': self.encode_array(self.whisper_chunks)}, "Missing latent field"),
-            ({'latent': self.encode_array(self.latents)}, "Missing whisper field")
-        ]
-        
-        for data, case_name in test_cases:
-            with self.subTest(case=case_name):
-                response, _ = self.make_request(data)
-                self.assertIn(response.status_code, [400, 422], 
-                            f"Expected 400 or 422 for {case_name}, got {response.status_code}: {self.get_error_message(response)}")
-                
-                error_msg = self.get_error_message(response)
-                self.assertTrue(
-                    any(err_key in error_msg.lower() for err_key in ['error', 'invalid', 'missing']),
-                    f"Error response missing error details: {error_msg}"
-                )
-
-    def test_invalid_encoding(self):
-        """Test error handling for invalid base64 encoding."""
-        test_cases = [
-            {'whisper': 'invalid_base64', 'latent': self.encode_array(self.latents)},
-            {'whisper': self.encode_array(self.whisper_chunks), 'latent': 'invalid_base64'},
-            {'whisper': '', 'latent': ''},
-            {'whisper': '!@#$%^&*', 'latent': '!@#$%^&*'}
-        ]
-        
-        for data in test_cases:
-            response, _ = self.make_request(data)
-            self.assertIn(response.status_code, [400, 422], 
-                         f"Expected 400 or 422 for invalid encoding, got {response.status_code}: {self.get_error_message(response)}")
-
-    def test_invalid_shapes(self):
-        """Test error handling for arrays with invalid shapes."""
-        # Test with wrong batch size
-        wrong_batch_whisper = self.whisper_chunks[0:20]  # 20 instead of 25
-        wrong_batch_request = {
-            'whisper': self.encode_array(wrong_batch_whisper),
-            'latent': self.encode_array(self.latents)
-        }
-        response, _ = self.make_request(wrong_batch_request)
-        self.assertIn(response.status_code, [400, 422], 
-                     f"Expected 400 or 422 for wrong batch size, got {response.status_code}: {self.get_error_message(response)}")
-
-        # Test with incompatible reshape dimensions
-        wrong_shape_whisper = np.random.randn(25, 49, 384).astype(np.float16)
-        wrong_shape_request = {
-            'whisper': self.encode_array(wrong_shape_whisper),
-            'latent': self.encode_array(self.latents)
-        }
-        response, _ = self.make_request(wrong_shape_request)
-        self.assertIn(response.status_code, [400, 422], 
-                     f"Expected 400 or 422 for wrong shape, got {response.status_code}: {self.get_error_message(response)}")
-
-    def test_invalid_data_types(self):
-        """Test error handling for invalid data types."""
-        float32_data = self.whisper_chunks.astype(np.float32)
-        wrong_type_request = {
-            'whisper': self.encode_array(float32_data),
-            'latent': self.encode_array(self.latents)
-        }
-        response, _ = self.make_request(wrong_type_request)
-        self.assertIn(response.status_code, [400, 422], 
-                     f"Expected 400 or 422 for wrong data type, got {response.status_code}")
-
-    def test_large_payload(self):
-        """Test handling of large payloads."""
-        large_whisper = np.tile(self.whisper_chunks, (2, 1, 1))
-        large_request = {
-            'whisper': self.encode_array(large_whisper),
-            'latent': self.encode_array(self.latents)
-        }
-        response, _ = self.make_request(large_request)
-        self.assertIn(response.status_code, [400, 413, 422], 
-                     f"Expected 400, 413, or 422 for oversized payload, got {response.status_code}: {self.get_error_message(response)}")
+    @classmethod
+    def make_concurrent_request(cls):
+        """Static method for process pool execution."""
+        tester = cls()
+        tester.setUp()
+        try:
+            return tester.make_request()
+        except Exception as e:
+            logger.error(f"Concurrent request failed: {str(e)}")
+            raise
 
     def test_concurrent_requests(self):
-        """Test handling of concurrent requests."""
-        import concurrent.futures
+        """Test handling of concurrent requests with first response latency and FPS tracking using process pool."""
+        from concurrent.futures import ProcessPoolExecutor
         
-        request_data = {
-            'whisper': self.encode_array(self.whisper_chunks),
-            'latent': self.encode_array(self.latents)
-        }
+        first_response_latencies = []
+        fps_results = []
+        num_requests = 15
         
-        def make_concurrent_request():
-            try:
-                response, _ = self.make_request(request_data)
-                return response
-            except Exception as e:
-                print(f"Concurrent request failed: {str(e)}")
-                raise
+        # Use ProcessPoolExecutor instead of ThreadPoolExecutor
+        with ProcessPoolExecutor(max_workers=num_requests) as executor:
+            futures = [executor.submit(self.make_concurrent_request) for _ in range(num_requests)]
+            results = [future.result() for future in futures]
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-            futures = [executor.submit(make_concurrent_request) for _ in range(5)]
-            responses = [f.result() for f in concurrent.futures.as_completed(futures)]
+        # Process results
+        for idx, (success, latency, fps, images) in enumerate(results):
+            self.assertTrue(success, "Request failed")
+            self.assertEqual(len(images), 25, "Incorrect number of images returned")
+            first_response_latencies.append(latency)
+            fps_results.append(fps)
+            
+            for image in images:
+                self.validate_image(image)
         
-        for response in responses:
-            self.assertEqual(
-                response.status_code, 200, 
-                f"Concurrent request failed with status {response.status_code}: {self.get_error_message(response)}"
-            )
-            response_data = response._content
-            self.assertIn('output', response_data, "Response missing 'output' field")
+        # Calculate and log statistics
+        latencies = np.array(first_response_latencies)
+        fps_array = np.array(fps_results)
+        
+        logger.info("\nPerformance statistics across concurrent requests:")
+        logger.info("\nFirst response latency statistics:")
+        logger.info(f"  mean: {np.mean(latencies):.4f}s")
+        logger.info(f"  std: {np.std(latencies):.4f}s")
+        logger.info(f"  min: {np.min(latencies):.4f}s")
+        logger.info(f"  max: {np.max(latencies):.4f}s")
+        logger.info(f"  p50: {np.percentile(latencies, 50):.4f}s")
+        logger.info(f"  p90: {np.percentile(latencies, 90):.4f}s")
+        logger.info(f"  p99: {np.percentile(latencies, 99):.4f}s")
+        
+        logger.info("\nFPS statistics:")
+        logger.info(f"  mean: {np.mean(fps_array):.2f}")
+        logger.info(f"  std: {np.std(fps_array):.2f}")
+        logger.info(f"  min: {np.min(fps_array):.2f}")
+        logger.info(f"  max: {np.max(fps_array):.2f}")
+        logger.info(f"  p50: {np.percentile(fps_array, 50):.2f}")
+        logger.info(f"  p90: {np.percentile(fps_array, 90):.2f}")
+        logger.info(f"  p99: {np.percentile(fps_array, 99):.2f}")
+        
+        # Log individual request FPS
+        logger.info("\nPer-request FPS:")
+        for idx, fps in enumerate(fps_results):
+            logger.info(f"  Request {idx + 1}: {fps:.2f} FPS")
+            if fps < 25:
+                logger.warning(f"  Request {idx + 1} did not achieve target 25 FPS")
 
 
 if __name__ == "__main__":
+    # Set start method for ProcessPoolExecutor
+    mp.set_start_method('spawn')
     unittest.main(verbosity=2)

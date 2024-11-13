@@ -1,24 +1,28 @@
-import os
+
 import base64
+import os
 import torch
 import wandb
 import json
 import time
+
 import numpy as np
 
 from pathlib import Path
 from typing import Dict, Any
 from dotenv import load_dotenv
 from diffusers import UNet2DConditionModel
-from mosec import Server, Worker, get_logger
+from mosec import SSEWorker, get_logger
 from mosec.errors import ClientError
-from mosec.mixin import MsgpackMixin
+from mosec.mixin import RedisShmIPCMixin
+
 
 # Setup logging and environment
 load_dotenv()
 logger = get_logger()
 
-class UNetWorker(MsgpackMixin, Worker):
+
+class UNetWorker(RedisShmIPCMixin, SSEWorker):
     def __init__(self):
         super().__init__()
         self.device = "cuda"
@@ -141,7 +145,7 @@ class UNetWorker(MsgpackMixin, Worker):
             logger.warning(msg)
             raise ClientError(msg)
 
-    def forward(self, data: Dict[str, Any]) -> Dict[str, str]:
+    def forward(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Process a single inference request"""
         try:
             start = time.perf_counter()
@@ -165,7 +169,6 @@ class UNetWorker(MsgpackMixin, Worker):
                 # Validate arrays
                 self._validate_arrays(whisper, latent)
             except ClientError as e:
-                # Mosec will handle ClientError with 400 status
                 raise
 
             # Prepare inputs
@@ -188,29 +191,11 @@ class UNetWorker(MsgpackMixin, Worker):
                 )
             logger.info(f"Inference time: {time.perf_counter() - start}s")
 
-            # Encode output
-            result = output.sample.detach().cpu().numpy().tobytes()
-            result_base64 = base64.b64encode(result).decode('utf-8')
-            
-            return {"output": result_base64}
+            # Pass the tensor directly to next worker
+            return output.sample
 
         except ClientError as e:
-            # Client errors (400)
             raise
         except Exception as e:
-            # Server errors (500)
             logger.error(f"Error in forward pass: {str(e)}", exc_info=True)
             raise
-
-def main():
-    server = Server()
-    server.append_worker(
-        UNetWorker,
-        num=1,
-        max_batch_size=1,
-        max_wait_time=0,
-    )
-    server.run()
-
-if __name__ == "__main__":
-    main()
