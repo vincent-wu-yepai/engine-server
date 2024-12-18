@@ -1,32 +1,43 @@
-import torch
 import time
-
+import torch
 import numpy as np
 
+from clearml import Model
+from zenml.logger import get_logger
 from diffusers import AutoencoderTiny
-from mosec import SSEWorker, get_logger
-from mosec.mixin import RedisShmIPCMixin
+
+logger = get_logger(__name__)
 
 
-logger = get_logger()
-
-
-class VAEWorker(RedisShmIPCMixin, SSEWorker):
+class VAEWorker():
     """VAE worker"""
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, model_id: str):
         self.device = "cuda"
+        self.model_id = model_id
         self._setup_model()
 
     def _setup_model(self):
         """Initialize VAE model"""
         try:
-            logger.info("Initializing VAE model...")
-            self.model = AutoencoderTiny.from_pretrained("madebyollin/taesd")
-            self.model.encoder = None
-            self.model.to(device=self.device)
+            logger.info("Loading VAE model from ClearML artifacts...")
+
+            model = Model(model_id=self.model_id)
+            model_path = model.get_local_copy()
+
+            metadata = model._get_model_data()['design']
+            self.model_config = metadata.get('model_config', {})
+            self.scaling_factor = metadata.get('scaling_factor', 1.0)
+
+            self.model = AutoencoderTiny(**self.model_config)
+
+            state_dict = torch.load(
+                model_path, map_location=self.device, weights_only=True
+            )
+            self.model.load_state_dict(state_dict)
+            self.model.to(device=self.device, dtype=torch.float16)
             self.model.eval()
+            self.model.encoder = None
             logger.info("VAE model initialized successfully")
         except Exception as e:
             logger.error(f"Error in VAE setup: {e}", exc_info=True)
@@ -40,7 +51,7 @@ class VAEWorker(RedisShmIPCMixin, SSEWorker):
             logger.info(f"Processing batch of {batch_size} images")
             
             # Scale latents according to VAE configuration
-            latents = (1 / self.model.config.scaling_factor) * latents
+            latents = latents / self.scaling_factor
             
             # Decode latents to image
             with torch.no_grad():
